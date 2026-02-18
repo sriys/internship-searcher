@@ -1,0 +1,179 @@
+Build a strict, logic-driven Internship Outreach Copilot.
+
+Tech stack:
+- Python 3
+- Flask
+- SQLite
+- pandas + openpyxl
+- requests + BeautifulSoup4
+- OpenAI API (use OPENAI_API_KEY from environment variables)
+
+No design needed. Minimal HTML templates only.
+
+PRIMARY GOAL:
+Convert accurate company website content into:
+1) A validated research pack (fact-based, with evidence)
+2) A strictly structured 120–155 word cold email
+3) Enforce cooldowns and anti-spam safeguards
+
+==============================
+RESEARCH SYSTEM (STRICT MODE)
+==============================
+
+Step 1: Website Fetcher
+
+For a given company URL:
+- Restrict crawling to same domain only
+- Fetch up to 6 pages max:
+  - homepage
+  - /about
+  - /careers
+  - /news OR /blog OR /press OR /insights
+  - first "services" or "what we do" link found
+  - first additional relevant internal link
+
+If page not found, skip.
+Strip:
+- navigation
+- footer
+- cookie banners
+- scripts
+Keep only:
+- headings
+- paragraph text
+Limit combined text to 18,000 characters max.
+
+==============================
+STEP A: FACT EXTRACTION PROMPT
+==============================
+
+Use this exact prompt when calling OpenAI:
+
+"You are a fact-extraction assistant. Use ONLY the provided page text. Do NOT add outside knowledge.
+
+Create exactly 4 research items.
+
+For each item output:
+- fact: one specific sentence
+- evidence: a 6–18 word quote copied verbatim from provided text
+- source_id: page key (home/about/careers/news/services/etc.)
+- use_in_email: true or false
+
+Rules:
+- Fact must be grounded in the evidence quote.
+- No numbers, dates, deals, rankings, clients unless explicitly in evidence.
+- Prefer describing what the company does, who they serve, where they operate, or what they value.
+- Avoid vague marketing claims unless explicitly quoted.
+- Output valid JSON:
+{
+  "items": [ ...4 objects... ]
+}"
+
+Store:
+- First 2 items where use_in_email=true
+- Save fact and source_id
+- If fewer than 2 usable facts, mark ResearchConfidence = LOW and block email generation.
+
+==============================
+STEP B: EMAIL GENERATION PROMPT
+==============================
+
+Use this exact prompt:
+
+"You write short cold emails. Use ONLY the inputs provided. Do NOT invent facts.
+
+Write an email with EXACTLY 6 paragraphs. Each paragraph must be 1–2 sentences.
+Total length: 120–155 words.
+
+Inputs:
+contact_name: {CONTACT}
+company_name: {COMPANY}
+company_sentence: {FACT_FROM_RESEARCH}
+track: {ib/consulting/econ_research/data/general}
+company_size: {small/mid/large/unknown}
+proof_line: {USER_PROOF_LINE}
+
+Email Structure:
+1) Greeting + who I am (high school senior in IB program in Glen Allen VA).
+2) Include company_sentence exactly as written.
+3) Include proof_line exactly as written.
+4) Ask (based on company_size):
+   - small/unknown: shadowing or small project-based opportunity
+   - mid: project-based support or shadowing
+   - large: brief conversation and guidance for high school path
+5) Routing sentence EXACTLY:
+   "If you're not the right person, who would you recommend I contact?"
+6) Close with opt-out EXACTLY:
+   "If you'd prefer I not follow up, I will respect that."
+
+Return JSON:
+{
+  "subject_options": [3 short subject lines],
+  "email_body": "full email"
+}
+No extra commentary."
+
+==============================
+VALIDATOR SYSTEM (MANDATORY)
+==============================
+
+After generating email:
+
+1) Check word count between 120 and 155.
+2) Ensure exactly 6 paragraphs separated by blank lines.
+3) Ensure paragraph 2 contains company_sentence exactly.
+4) Ensure paragraph 3 contains proof_line exactly.
+5) Ensure routing sentence matches exactly.
+6) Ensure opt-out line matches exactly.
+
+7) Anti-hallucination rule:
+If email contains:
+- numbers not in company_sentence
+- words like "recent deal", "announced", "transaction", "clients", "ranked", "award", unless present in company_sentence
+→ Regenerate with stricter instruction: "Do not include any claims beyond company_sentence."
+
+If validation fails, regenerate once.
+If still fails, block draft and show error.
+
+==============================
+COOLDOWN RULES
+==============================
+
+- Max 1 initial email per company per 75 days
+- Followup1 = sent date + 5 business days
+- Followup2 = followup1 + 10 business days
+- Stop after Followup2
+- If DoNotContact = true, block generation
+
+==============================
+OUTPUT STORAGE
+==============================
+
+Store per company:
+- Research Bullet 1
+- Research Source 1
+- Research Bullet 2
+- Research Source 2
+- ResearchConfidence
+- Subject Line
+- Email Draft
+- Status
+- LastContactDate
+- Followup1Date
+- Followup2Date
+- CooldownUntil
+
+==============================
+DO NOT:
+==============================
+
+- Do not auto-send emails.
+- Do not scrape LinkedIn.
+- Do not add external facts not in website text.
+- Do not exceed 6 crawled pages.
+
+Deliver:
+- Flask app
+- Minimal HTML templates
+- Clear comments
+- Working research + strict email generator + validator
