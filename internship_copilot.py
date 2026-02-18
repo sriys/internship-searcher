@@ -3,12 +3,14 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import hashlib
 import json
-import math
 import re
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Dict, Iterable, List, Optional, Tuple
+from html import unescape
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
@@ -47,14 +49,15 @@ TRACK_MAP = {
 }
 
 CATEGORY_KEYWORDS = {
-    "what_they_do": ["provides", "offers", "specializes", "services", "solutions", "advisory"],
-    "who_they_serve": ["clients", "customers", "institutions", "businesses", "organizations"],
-    "capability": ["analytics", "strategy", "data", "research", "operations", "investment", "consulting"],
+    "what_they_do": ["provides", "offers", "specializes", "services", "solutions", "advisory", "practice"],
+    "who_they_serve": ["clients", "customers", "institutions", "businesses", "organizations", "investors"],
+    "capability": ["analytics", "strategy", "data", "research", "operations", "investment", "consulting", "modeling"],
     "geography": ["virginia", "richmond", "dc", "washington", "regional", "global"],
     "values": ["mission", "values", "integrity", "commitment", "culture", "purpose"],
 }
 
 GENERAL_INBOX_PREFIXES = ("info@", "careers@", "contact@")
+PREFERRED_PATHS = ["/", "/about", "/services", "/what-we-do", "/careers", "/news", "/blog", "/press", "/insights", "/team", "/leadership", "/people", "/contact"]
 
 
 @dataclass
@@ -82,6 +85,13 @@ class FactItem:
 class ResearchPack:
     facts: List[FactItem] = field(default_factory=list)
     confidence: str = "Low"
+
+
+@dataclass
+class PageData:
+    url: str
+    html: str
+    text: str
 
 
 @dataclass
@@ -121,32 +131,32 @@ class CompanyOutput:
 
 
 class InternshipOutreachCopilot:
-    def __init__(self, max_pages: int = 6, request_delay_s: float = 1.5):
+    def __init__(self, max_pages: int = 6, request_delay_s: float = 1.5, cache_days: int = 7):
         self.max_pages = max_pages
         self.request_delay_s = request_delay_s
+        self.cache_days = cache_days
+        self.cache_dir = Path(".cache/pages")
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def process_company(self, company: CompanyInput, start_date: Optional[dt.date] = None) -> CompanyOutput:
         start_date = start_date or dt.date.today()
 
-        page_texts = self._crawl_company_pages(company.website_url)
-        research = self._extract_research_pack(page_texts)
+        pages = self._crawl_company_pages(company.website_url)
+        research = self._extract_research_pack(pages)
         company_sentence = self._build_company_sentence(research, company.industry_focus)
 
-        contacts = self._extract_contacts(company, page_texts)
-        contact_needed = len(contacts) == 0
-
+        contacts = self._extract_contacts(company, pages)
         scored = [self._score_contact(c, company.track_target, company.size_bucket, company.location) for c in contacts]
         primary, secondary = self._select_two_contacts(scored)
 
+        contact_needed = len(contacts) == 0 or self._only_general_inbox(contacts)
         research_needed = research.confidence == "Low"
 
         email1 = self._build_email(company, primary, company_sentence, decision_maker=True) if primary else None
         email2 = self._build_email(company, secondary, company_sentence, decision_maker=False) if secondary else None
 
         if self._only_general_inbox(contacts):
-            # Reliability guard: only one email if only inboxes exist.
             email2 = None
-            contact_needed = True
 
         flags = {
             "contact_needed": contact_needed,
@@ -172,92 +182,108 @@ class InternshipOutreachCopilot:
             },
             email1=asdict(email1) if email1 else None,
             email2=asdict(email2) if email2 else None,
-            followup_dates={
-                "followup_1": followup_1.isoformat(),
-                "followup_2": followup_2.isoformat(),
-            },
+            followup_dates={"followup_1": followup_1.isoformat(), "followup_2": followup_2.isoformat()},
             cooldown_until=cooldown_until.isoformat(),
             flags=flags,
         )
 
     # ---------- Crawl + research ----------
 
-    def _crawl_company_pages(self, website_url: str) -> Dict[str, str]:
+    def _crawl_company_pages(self, website_url: str) -> List[PageData]:
         seed = self._normalize_url(website_url)
         if not seed:
-            return {}
+            return []
 
-        parsed_seed = urlparse(seed)
-        allowed_host = parsed_seed.netloc
-        preferred_paths = ["/", "/about", "/services", "/what-we-do", "/careers", "/news", "/blog", "/press", "/insights"]
-
-        queue = [urljoin(seed, p) for p in preferred_paths]
-        seen, results = set(), {}
+        allowed_host = urlparse(seed).netloc
+        queue = [urljoin(seed, path) for path in PREFERRED_PATHS]
+        seen: set[str] = set()
+        results: List[PageData] = []
 
         while queue and len(results) < self.max_pages:
             url = queue.pop(0)
-            if url in seen:
+            normalized = self._normalize_page_url(url)
+            if not normalized or normalized in seen:
                 continue
-            seen.add(url)
+            seen.add(normalized)
 
-            if urlparse(url).netloc != allowed_host:
+            if urlparse(normalized).netloc != allowed_host:
                 continue
 
-            text = self._fetch_page_text(url)
-            if text and self._is_content_rich(text):
-                results[url] = text
-                links = self._extract_internal_links(text, url, allowed_host)
-                for link in links:
-                    if link not in seen and len(queue) < 30:
-                        queue.append(link)
+            page = self._fetch_page(normalized)
+            if not page:
+                continue
+
+            if self._is_content_rich(page.text):
+                results.append(page)
+
+            for link in self._extract_internal_links(page.html, page.url, allowed_host):
+                if link not in seen and len(queue) < 40:
+                    queue.append(link)
+
         return results
 
-    def _fetch_page_text(self, url: str) -> str:
+    def _fetch_page(self, url: str) -> Optional[PageData]:
+        cached = self._read_cache(url)
+        if cached:
+            return cached
+
         try:
-            req = Request(url, headers={"User-Agent": "Mozilla/5.0 InternshipOutreachBot/1.0"})
-            with urlopen(req, timeout=12) as r:
-                if "text/html" not in r.headers.get("Content-Type", ""):
-                    return ""
-                html = r.read().decode("utf-8", errors="ignore")
+            req = Request(url, headers={"User-Agent": "Mozilla/5.0 InternshipOutreachBot/2.0"})
+            with urlopen(req, timeout=15) as response:
+                if "text/html" not in response.headers.get("Content-Type", ""):
+                    return None
+                html = response.read().decode("utf-8", errors="ignore")
         except Exception:
-            return ""
+            return None
         finally:
             time.sleep(self.request_delay_s)
 
-        # Keep raw HTML snippets for contact extraction; clean for research use.
-        clean = re.sub(r"(?is)<(script|style|noscript).*?>.*?</\1>", " ", html)
-        clean = re.sub(r"(?is)<(nav|footer).*?>.*?</\1>", " ", clean)
-        clean = re.sub(r"(?s)<[^>]+>", " ", clean)
-        clean = re.sub(r"\s+", " ", clean).strip()
-        return clean
+        text = self._clean_html_to_text(html)
+        page = PageData(url=url, html=html, text=text)
+        self._write_cache(url, page)
+        return page
 
-    def _extract_internal_links(self, text: str, current_url: str, allowed_host: str) -> List[str]:
-        # text here is cleaned; best effort link discovery from current URL only.
-        return []
+    def _clean_html_to_text(self, html: str) -> str:
+        text = re.sub(r"(?is)<(script|style|noscript).*?>.*?</\\1>", " ", html)
+        text = re.sub(r"(?is)<(nav|footer|header).*?>.*?</\\1>", " ", text)
+        text = re.sub(r"(?s)<[^>]+>", " ", text)
+        text = unescape(text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
 
-    def _is_content_rich(self, text: str) -> bool:
-        return len(text) >= 800 and len(re.findall(r"[.!?]", text)) >= 6
+    def _extract_internal_links(self, html: str, current_url: str, allowed_host: str) -> List[str]:
+        hrefs = re.findall(r'href=["\']([^"\']+)["\']', html, flags=re.I)
+        links: List[str] = []
+        for href in hrefs:
+            if href.startswith(("mailto:", "tel:", "javascript:", "#")):
+                continue
+            candidate = self._normalize_page_url(urljoin(current_url, href))
+            if not candidate:
+                continue
+            if urlparse(candidate).netloc == allowed_host:
+                links.append(candidate)
+        return links
 
-    def _extract_research_pack(self, pages: Dict[str, str]) -> ResearchPack:
+    def _extract_research_pack(self, pages: Sequence[PageData]) -> ResearchPack:
         items: List[FactItem] = []
-        for url, text in pages.items():
-            sents = self._split_sentences(text)
-            for sent in sents:
-                category = self._classify_sentence(sent)
+        for page in pages:
+            for sentence in self._split_sentences(page.text):
+                category = self._classify_sentence(sentence)
                 if not category:
                     continue
-                evidence = self._extract_evidence(sent)
-                usable = category != "values" and len(sent.split()) >= 8
-                items.append(FactItem(
-                    fact=sent.strip(),
-                    evidence_quote=evidence,
-                    source_url=url,
-                    category=category,
-                    usable_in_email=usable,
-                ))
-                if len(items) >= 30:
+                usable = category != "values" and len(sentence.split()) >= 8
+                items.append(
+                    FactItem(
+                        fact=sentence.strip(),
+                        evidence_quote=self._extract_evidence(sentence),
+                        source_url=page.url,
+                        category=category,
+                        usable_in_email=usable,
+                    )
+                )
+                if len(items) >= 40:
                     break
-            if len(items) >= 30:
+            if len(items) >= 40:
                 break
 
         deduped = self._dedupe_fact_items(items)[:4]
@@ -268,190 +294,224 @@ class InternshipOutreachCopilot:
 
     def _split_sentences(self, text: str) -> List[str]:
         chunks = re.split(r"(?<=[.!?])\s+", text)
-        return [c.strip() for c in chunks if 30 <= len(c.strip()) <= 260]
+        return [chunk.strip() for chunk in chunks if 40 <= len(chunk.strip()) <= 260]
 
     def _classify_sentence(self, sentence: str) -> Optional[str]:
         lower = sentence.lower()
-        for category, kws in CATEGORY_KEYWORDS.items():
-            if any(k in lower for k in kws):
+        for category, keywords in CATEGORY_KEYWORDS.items():
+            if any(keyword in lower for keyword in keywords):
                 return category
         return None
 
     def _extract_evidence(self, sentence: str) -> str:
         words = sentence.split()
-        if len(words) < 6:
+        if len(words) <= 18:
             return sentence
-        end = min(len(words), 18)
-        start = max(0, min(2, end - 6))
-        quote = " ".join(words[start:end])
-        return quote.strip('"')
+        return " ".join(words[:18])
 
-    def _dedupe_fact_items(self, items: List[FactItem]) -> List[FactItem]:
+    def _dedupe_fact_items(self, items: Sequence[FactItem]) -> List[FactItem]:
         seen = set()
-        out = []
+        deduped = []
         for item in items:
-            key = (item.category, item.fact[:100].lower())
+            key = (item.category, item.fact[:120].lower())
             if key in seen:
                 continue
             seen.add(key)
-            out.append(item)
-        return out
+            deduped.append(item)
+        return deduped
 
     def _build_company_sentence(self, research: ResearchPack, industry_focus: str) -> str:
         if research.confidence != "OK":
             return f"I was interested in the work your organization does in {industry_focus or 'your field'}."
 
-        candidates = [x for x in research.facts if x.usable_in_email and x.category != "values"]
+        candidates = [fact for fact in research.facts if fact.usable_in_email and fact.category != "values"]
         if not candidates:
             return f"I was interested in the work your organization does in {industry_focus or 'your field'}."
 
-        fact = candidates[0].fact
-        trimmed = fact.rstrip(".")
-        return f"I was interested in your work and noted that {trimmed.lower()}."
+        selected = candidates[0].fact.rstrip(".")
+        return f"I was interested in your work and noticed that {selected[0].lower() + selected[1:]} .".replace(" .", ".")
+
+    def _is_content_rich(self, text: str) -> bool:
+        return len(text) >= 800 and len(re.findall(r"[.!?]", text)) >= 6
 
     # ---------- Contacts + scoring ----------
 
-    def _extract_contacts(self, company: CompanyInput, pages: Dict[str, str]) -> List[ContactCandidate]:
+    def _extract_contacts(self, company: CompanyInput, pages: Sequence[PageData]) -> List[ContactCandidate]:
         candidates: List[ContactCandidate] = []
+
         if company.known_contacts:
             candidates.extend(self._parse_known_contacts(company.known_contacts, company.website_url, company.location))
 
         email_regex = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-        for url, text in pages.items():
-            for match in email_regex.finditer(text):
-                email = match.group(0).lower()
-                name, title = self._guess_identity_from_email(email)
-                if any(email == c.email for c in candidates):
-                    continue
-                candidates.append(ContactCandidate(name=name, title=title, email=email, page_url_source=url, location=company.location))
+        title_hint_regex = re.compile(
+            r"(?i)(founder|ceo|owner|coo|cto|cfo|director|vp|head|manager|lead|operations|analyst|consultant|research)")
 
-        # Add fallback general inboxes when same domain exists
+        for page in pages:
+            for match in email_regex.finditer(page.html):
+                email = match.group(0).lower()
+                if any(existing.email == email for existing in candidates):
+                    continue
+
+                context_start = max(0, match.start() - 220)
+                context_end = min(len(page.html), match.end() + 220)
+                context = re.sub(r"(?s)<[^>]+>", " ", page.html[context_start:context_end])
+                context = re.sub(r"\s+", " ", unescape(context))
+
+                name = self._guess_name_from_context(context) or self._guess_identity_from_email(email)[0]
+                title_match = title_hint_regex.search(context)
+                title = title_match.group(1).title() if title_match else self._guess_identity_from_email(email)[1]
+                candidates.append(
+                    ContactCandidate(
+                        name=name,
+                        title=title,
+                        email=email,
+                        page_url_source=page.url,
+                        location=company.location,
+                    )
+                )
+
         domain = urlparse(self._normalize_url(company.website_url) or "").netloc
         if domain:
             for prefix in GENERAL_INBOX_PREFIXES:
-                email = f"{prefix}{domain}"
-                if not any(c.email == email for c in candidates):
-                    candidates.append(ContactCandidate(name="", title="General Inbox", email=email, page_url_source=company.website_url, location=company.location))
+                fallback = f"{prefix}{domain}"
+                if not any(existing.email == fallback for existing in candidates):
+                    candidates.append(
+                        ContactCandidate(
+                            name="",
+                            title="General Inbox",
+                            email=fallback,
+                            page_url_source=company.website_url,
+                            location=company.location,
+                        )
+                    )
 
         return candidates
 
+    def _guess_name_from_context(self, context: str) -> str:
+        match = re.search(r"\b([A-Z][a-z]+\s+[A-Z][a-z]+)\b", context)
+        return match.group(1) if match else ""
+
     def _parse_known_contacts(self, known: str, source_url: str, location: str) -> List[ContactCandidate]:
-        # Format: Name|Title|email ; Name|Title|email
-        out = []
+        parsed: List[ContactCandidate] = []
         for part in known.split(";"):
-            bits = [x.strip() for x in part.split("|")]
+            bits = [token.strip() for token in part.split("|")]
             if len(bits) == 3 and "@" in bits[2]:
-                out.append(ContactCandidate(name=bits[0], title=bits[1], email=bits[2].lower(), page_url_source=source_url, location=location))
-        return out
+                parsed.append(ContactCandidate(name=bits[0], title=bits[1], email=bits[2].lower(), page_url_source=source_url, location=location))
+        return parsed
 
     def _guess_identity_from_email(self, email: str) -> Tuple[str, str]:
         local = email.split("@", 1)[0]
-        if any(local.startswith(p[:-1]) for p in GENERAL_INBOX_PREFIXES):
+        if any(local.startswith(prefix[:-1]) for prefix in GENERAL_INBOX_PREFIXES):
             return "", "General Inbox"
         parts = re.split(r"[._-]+", local)
-        if len(parts) >= 2 and all(p.isalpha() for p in parts[:2]):
-            name = f"{parts[0].title()} {parts[1].title()}"
-            return name, ""
+        if len(parts) >= 2 and parts[0].isalpha() and parts[1].isalpha():
+            return f"{parts[0].title()} {parts[1].title()}", ""
         return "", ""
 
-    def _score_contact(self, c: ContactCandidate, track: str, size_bucket: str, target_location: str) -> ScoredContact:
-        authority = self._authority_score(c.title, size_bucket)
-        reply = 0.0
-        fit = 0.0
+    def _score_contact(self, contact: ContactCandidate, track: str, size_bucket: str, target_location: str) -> ScoredContact:
+        authority = self._authority_score(contact.title, size_bucket)
 
-        if c.email:
+        reply = 0.0
+        if contact.email:
             reply += 15
-        if c.location and target_location and c.location.lower() in target_location.lower():
+        if contact.location and target_location and contact.location.lower() in target_location.lower():
             reply += 15
-        if re.search(r"manager|director|lead", c.title, flags=re.I):
+        if re.search(r"manager|director|lead", contact.title, flags=re.I):
             reply += 10
-        if c.title.lower() == "general inbox":
+        if contact.title.lower() == "general inbox":
             reply += 5
-        if re.search(r"global head|chief|partner", c.title, flags=re.I) and size_bucket.lower() == "large":
+        if size_bucket.lower() == "large" and re.search(r"global head|chief|partner", contact.title, flags=re.I):
             reply -= 15
 
-        if self._title_matches_track(c.title, track):
-            fit += 10
-        elif c.title and not self._title_matches_track(c.title, track):
-            fit -= 10
-
+        fit = 10 if self._title_matches_track(contact.title, track) else (-10 if contact.title else 0)
         final = 0.55 * authority + 0.35 * reply + 0.10 * fit
-        return ScoredContact(**asdict(c), authority=authority, reply_likelihood=reply, fit=fit, final_score=round(final, 2))
+        return ScoredContact(**asdict(contact), authority=authority, reply_likelihood=reply, fit=fit, final_score=round(final, 2))
 
     def _authority_score(self, title: str, size_bucket: str) -> float:
         t = (title or "").lower()
         sb = size_bucket.lower()
-
         if sb == "small":
-            if re.search(r"founder|ceo|owner", t): return 80
-            if "coo" in t: return 70
-            if re.search(r"head|director", t): return 60
-            if "ops" in t: return 55
-            if "manager" in t: return 45
+            if re.search(r"founder|ceo|owner", t):
+                return 80
+            if "coo" in t:
+                return 70
+            if re.search(r"head|director", t):
+                return 60
+            if "ops" in t:
+                return 55
+            if "manager" in t:
+                return 45
         elif sb == "mid":
-            if "director" in t: return 70
-            if "vp" in t: return 65
-            if "senior manager" in t: return 55
-            if "office lead" in t: return 50
+            if "director" in t:
+                return 70
+            if "vp" in t:
+                return 65
+            if "senior manager" in t:
+                return 55
+            if "office lead" in t:
+                return 50
         elif sb == "large":
-            if re.search(r"ceo|chief|cfo|coo|cto", t): return 0
-            if "senior manager" in t: return 65
-            if "director" in t: return 60
-            if re.search(r"team lead|manager", t): return 55
-            if "office lead" in t: return 45
-
+            if re.search(r"ceo|chief|cfo|coo|cto", t):
+                return 0
+            if "senior manager" in t:
+                return 65
+            if "director" in t:
+                return 60
+            if re.search(r"team lead|manager", t):
+                return 55
+            if "office lead" in t:
+                return 45
         if "general inbox" in t:
             return 20
         return 40
 
     def _title_matches_track(self, title: str, track: str) -> bool:
         title_l = (title or "").lower()
-        track_l = (track or "").lower()
-        mapping = {
-            "ib": ["investment", "banking", "finance", "capital", "advisory"],
+        keywords = {
+            "ib": ["investment", "bank", "finance", "capital", "advisory"],
             "consulting": ["consult", "strategy", "operations", "advisory"],
             "tech/data": ["data", "analytics", "engineering", "technology"],
             "econ research": ["econom", "research", "policy", "analysis"],
-        }
-        kws = mapping.get(track_l, [])
-        return any(k in title_l for k in kws)
+        }.get((track or "").lower(), [])
+        return any(keyword in title_l for keyword in keywords)
 
-    def _select_two_contacts(self, scored: List[ScoredContact]) -> Tuple[Optional[ScoredContact], Optional[ScoredContact]]:
+    def _select_two_contacts(self, scored: Sequence[ScoredContact]) -> Tuple[Optional[ScoredContact], Optional[ScoredContact]]:
         if not scored:
             return None, None
 
-        sorted_contacts = sorted(scored, key=lambda c: c.final_score, reverse=True)
-        primary = sorted_contacts[0]
+        ordered = sorted(scored, key=lambda item: item.final_score, reverse=True)
+        primary = ordered[0]
 
         secondary = None
-        for c in sorted_contacts[1:]:
-            if self._seniority_tier(c.title) != self._seniority_tier(primary.title):
-                secondary = c
+        for candidate in ordered[1:]:
+            if self._seniority_tier(candidate.title) != self._seniority_tier(primary.title):
+                secondary = candidate
                 break
-        if not secondary and len(sorted_contacts) > 1:
-            secondary = max(sorted_contacts[1:], key=lambda x: x.reply_likelihood)
-
+        if not secondary and len(ordered) > 1:
+            secondary = max(ordered[1:], key=lambda item: item.reply_likelihood)
         return primary, secondary
 
     def _seniority_tier(self, title: str) -> str:
         t = (title or "").lower()
-        if re.search(r"ceo|founder|chief|owner|partner", t): return "exec"
-        if re.search(r"vp|director|head", t): return "director"
-        if re.search(r"manager|lead|ops", t): return "manager"
-        if "general inbox" in t: return "inbox"
+        if re.search(r"ceo|founder|chief|owner|partner", t):
+            return "exec"
+        if re.search(r"vp|director|head", t):
+            return "director"
+        if re.search(r"manager|lead|ops", t):
+            return "manager"
+        if "general inbox" in t:
+            return "inbox"
         return "unknown"
 
-    def _only_general_inbox(self, contacts: List[ContactCandidate]) -> bool:
-        if not contacts:
-            return False
-        return all(c.title.lower() == "general inbox" for c in contacts)
+    def _only_general_inbox(self, contacts: Sequence[ContactCandidate]) -> bool:
+        return bool(contacts) and all(contact.title.lower() == "general inbox" for contact in contacts)
 
     # ---------- Email generation ----------
 
     def _build_email(self, company: CompanyInput, contact: ScoredContact, company_sentence: str, decision_maker: bool) -> EmailDraft:
         track_phrase, skill_key, proof_key = TRACK_MAP.get((company.track_target or "").lower(), ("the field", "ops", "business_ops"))
-        skill_cluster = SKILL_CLUSTERS[skill_key]
         proof_line = PROOF_LINES[proof_key]
+        skill_cluster = SKILL_CLUSTERS[skill_key]
 
         greeting = contact.name or contact.title or "there"
 
@@ -461,10 +521,8 @@ class InternshipOutreachCopilot:
                 f"Hello {greeting},\n\n"
                 f"My name is {PROFILE['name']}, and I am a senior at {PROFILE['school']} in {PROFILE['location']} in the {PROFILE['program']}, with a strong interest in {track_phrase}.\n\n"
                 f"{company_sentence}\n\n"
-                f"Over the past year, I have honed my skills in {skill_cluster}. {proof_line} "
-                f"I would be grateful for any opportunity to intern, job-shadow, or assist with a project at {company.company_name} in a way that is appropriate for a high school student.\n\n"
-                "Thank you for considering my request. I would love to discuss any possible opportunities or learn about your recommended pathways for students interested in this field. "
-                "I have attached my résumé and can provide references upon request.\n\n"
+                f"Over the past year, I have honed my skills in {skill_cluster}. {proof_line} I would be grateful for any opportunity to intern, job-shadow, or assist with a project at {company.company_name} in a way that is appropriate for a high school student.\n\n"
+                "Thank you for considering my request. I would love to discuss any possible opportunities or learn about your recommended pathways for students interested in this field. I have attached my résumé and can provide references upon request.\n\n"
                 "Sincerely,\n"
                 f"{PROFILE['name']}\n"
                 f"{PROFILE['email']}\n"
@@ -476,8 +534,7 @@ class InternshipOutreachCopilot:
                 f"Hello {greeting},\n\n"
                 f"My name is {PROFILE['name']}, and I am a senior at {PROFILE['school']} in {PROFILE['location']} in the {PROFILE['program']}, interested in {track_phrase}.\n\n"
                 f"{company_sentence}\n\n"
-                f"I have experience with {skill_cluster} and recently {proof_line.lower()} "
-                "Would you be open to a brief conversation, or is there someone on your team you would recommend I contact about shadowing or a small project-based opportunity this summer?\n\n"
+                f"I have experience with {skill_cluster} and recently {proof_line.lower()} Would you be open to a brief conversation, or is there someone on your team you would recommend I contact about shadowing or a small project-based opportunity this summer?\n\n"
                 "Thank you for your time. I have attached my résumé and can provide references upon request.\n\n"
                 "Sincerely,\n"
                 f"{PROFILE['name']}\n"
@@ -485,6 +542,27 @@ class InternshipOutreachCopilot:
                 f"{PROFILE['phone']}"
             )
 
+        return EmailDraft(subject=subject, body=body)
+
+    def build_followup_email(self, previous_subject: str, contact_name_or_title: str, company_name: str, number: int) -> EmailDraft:
+        subject = f"Re: {previous_subject}"
+        if number == 1:
+            body = (
+                f"Hello {contact_name_or_title},\n\n"
+                f"I wanted to follow up on my note from last week about opportunities to shadow or support a small project at {company_name}.\n\n"
+                "If helpful, I can adapt to whatever is most appropriate for a high school student (short shadowing block, project assistance, or research support).\n\n"
+                "Thank you again for your time.\n\n"
+                "Sincerely,\n"
+                f"{PROFILE['name']}"
+            )
+        else:
+            body = (
+                f"Hello {contact_name_or_title},\n\n"
+                f"Quick final follow-up on my earlier outreach to {company_name}. If there is someone else I should contact for student shadowing or project opportunities, I would be very grateful for a referral.\n\n"
+                "Thank you for your consideration.\n\n"
+                "Sincerely,\n"
+                f"{PROFILE['name']}"
+            )
         return EmailDraft(subject=subject, body=body)
 
     def _validate_email_draft(self, body: str, company_name: str) -> bool:
@@ -495,10 +573,6 @@ class InternshipOutreachCopilot:
         if company_name not in body:
             return False
         if len(body.split()) > 240:
-            return False
-        # Limit extra claims via simple proper noun count heuristic.
-        proper_nouns = re.findall(r"\b[A-Z][a-z]+\b", body)
-        if len(proper_nouns) > 45:
             return False
         return True
 
@@ -518,54 +592,80 @@ class InternshipOutreachCopilot:
         if not url:
             return ""
         if not url.startswith(("http://", "https://")):
-            url = "https://" + url
-        p = urlparse(url)
-        if not p.netloc:
+            url = f"https://{url}"
+        parsed = urlparse(url)
+        if not parsed.netloc:
             return ""
-        return f"{p.scheme}://{p.netloc}"
+        return f"{parsed.scheme}://{parsed.netloc}"
+
+    def _normalize_page_url(self, url: str) -> str:
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.netloc:
+            return ""
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/") or f"{parsed.scheme}://{parsed.netloc}"
+
+    def _cache_key(self, url: str) -> str:
+        return hashlib.sha256(url.encode("utf-8")).hexdigest()
+
+    def _read_cache(self, url: str) -> Optional[PageData]:
+        path = self.cache_dir / f"{self._cache_key(url)}.json"
+        if not path.exists():
+            return None
+        if dt.datetime.now() - dt.datetime.fromtimestamp(path.stat().st_mtime) > dt.timedelta(days=self.cache_days):
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            return PageData(url=payload["url"], html=payload["html"], text=payload["text"])
+        except Exception:
+            return None
+
+    def _write_cache(self, url: str, page: PageData) -> None:
+        path = self.cache_dir / f"{self._cache_key(url)}.json"
+        path.write_text(json.dumps(asdict(page)), encoding="utf-8")
 
 
 def read_companies_csv(path: str) -> List[CompanyInput]:
-    out = []
-    with open(path, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            out.append(CompanyInput(
-                company_name=row.get("company_name", "").strip(),
-                website_url=row.get("website_url", "").strip(),
-                location=row.get("location", "").strip(),
-                industry_focus=row.get("industry_focus", "").strip(),
-                track_target=row.get("track target", row.get("track_target", "")).strip(),
-                size_bucket=row.get("size_bucket", "unknown").strip().lower(),
-                approach_hint=row.get("approach_hint", "").strip(),
-                known_contacts=row.get("known_contacts", "").strip(),
-            ))
-    return out
+    companies: List[CompanyInput] = []
+    with open(path, newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            companies.append(
+                CompanyInput(
+                    company_name=row.get("company_name", "").strip(),
+                    website_url=row.get("website_url", "").strip(),
+                    location=row.get("location", "").strip(),
+                    industry_focus=row.get("industry_focus", "").strip(),
+                    track_target=row.get("track_target", row.get("track target", "")).strip(),
+                    size_bucket=row.get("size_bucket", "unknown").strip().lower(),
+                    approach_hint=row.get("approach_hint", "").strip(),
+                    known_contacts=row.get("known_contacts", "").strip(),
+                )
+            )
+    return companies
 
 
 def run_daily_pipeline(companies: Iterable[CompanyInput], start_date: Optional[dt.date] = None) -> List[CompanyOutput]:
     engine = InternshipOutreachCopilot()
-    results = []
-    for c in companies:
-        if not c.company_name or not c.website_url:
+    outputs = []
+    for company in companies:
+        if not company.company_name or not company.website_url:
             continue
-        results.append(engine.process_company(c, start_date=start_date))
-    return results
+        outputs.append(engine.process_company(company, start_date=start_date))
+    return outputs
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Internship Outreach Copilot")
-    parser.add_argument("--input", required=True, help="CSV of companies")
+    parser.add_argument("--input", required=True, help="Input CSV path")
     parser.add_argument("--output", default="outreach_output.json", help="Output JSON path")
     args = parser.parse_args()
 
     companies = read_companies_csv(args.input)
-    outputs = run_daily_pipeline(companies)
-    payload = [asdict(o) for o in outputs]
+    output = [asdict(item) for item in run_daily_pipeline(companies)]
 
-    with open(args.output, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
+    with open(args.output, "w", encoding="utf-8") as handle:
+        json.dump(output, handle, indent=2)
 
-    print(f"Processed {len(outputs)} companies -> {args.output}")
+    print(f"Processed {len(output)} companies -> {args.output}")
 
 
 if __name__ == "__main__":

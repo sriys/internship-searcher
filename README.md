@@ -1,24 +1,36 @@
 # Internship Outreach Copilot
 
-A repeatable automation engine for cold outreach to internships, shadowing, and project-based opportunities.
+This is a **Replit-ready** Python tool that automates internship outreach prep per company:
 
-## What it does
+- company research from the company site
+- contact extraction and scoring
+- two role-specific email drafts
+- follow-up and cooldown scheduling
 
-For each company row in your CSV, this tool:
+## What this automates end-to-end
 
-1. Crawls up to 6 pages on the company domain.
-2. Builds a research pack with evidence-backed facts and confidence scoring.
-3. Extracts contact candidates from known contacts and discovered emails.
-4. Scores and chooses two strategic contacts:
+For each company row:
+
+1. Crawls up to 6 internal pages (domain-limited).
+2. Cleans content and extracts evidence-backed research facts.
+3. Scores research confidence.
+4. Extracts contact candidates from known contacts + discovered page emails.
+5. Ranks contacts and selects:
    - Decision maker
    - Reachable operator
-5. Generates personalized email drafts using your template style.
-6. Computes follow-up dates and cooldown windows.
-7. Outputs a structured JSON record with flags for manual review.
+6. Generates two personalized emails using your requested template style.
+7. Schedules follow-ups (+5 business days, +10 business days) and a 75-day cooldown.
+8. Outputs a structured JSON object with review flags.
 
-## Input CSV columns
+## What this does **not** do
 
-Required:
+- It does not send emails automatically (safety + account integration required).
+- It does not scrape LinkedIn.
+
+## Input CSV format
+
+Required columns:
+
 - `company_name`
 - `website_url`
 - `location`
@@ -27,30 +39,33 @@ Required:
 - `size_bucket` (`small`, `mid`, `large`, `unknown`)
 
 Optional:
-- `approach_hint`
-- `known_contacts` in format: `Name|Title|email; Name|Title|email`
 
-## Usage
+- `approach_hint`
+- `known_contacts` format: `Name|Title|email; Name|Title|email`
+
+## Run locally or in Replit
 
 ```bash
 python internship_copilot.py --input companies.csv --output outreach_output.json
 ```
 
-## Output fields (per company)
+## Output schema per company
 
 - `primary_contact`
 - `secondary_contact`
-- `research` (2 bullets + confidence)
+- `research` (`bullets`, `confidence`)
 - `email1`
 - `email2`
 - `followup_dates`
 - `cooldown_until`
-- `flags` (`contact_needed`, `research_needed`, `needs_review`)
+- `flags`:
+  - `contact_needed`
+  - `research_needed`
+  - `needs_review`
 
 ## Reliability safeguards included
 
 - Low research confidence forces generic company sentence.
-- Only general inboxes -> only one generated email + `contact_needed=true`.
-- Draft validation checks greeting, company mention, sentence presence, and length.
-- Follow-ups: +5 business days, then +10 business days.
-- Cooldown: 75 days before restarting a new sequence at same company.
+- If only general inboxes are available, second email is suppressed and `contact_needed=true`.
+- Draft validation enforces greeting/company mention/length constraints.
+- Page cache with 7-day TTL is used to reduce repeated crawling and speed reruns.
